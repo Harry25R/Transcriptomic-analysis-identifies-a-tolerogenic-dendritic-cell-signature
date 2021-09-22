@@ -1,0 +1,769 @@
+---
+title: "Tolerogenic Dendritic Cell Phenotype"
+author: "Harry Robertson"
+date: "06/05/2021"
+output: html_document
+---
+
+# Investigating the Tolerogenic Dendritic Cell Phenotype
+
+```{r, echo=FALSE, message=FALSE}
+library(Biobase)
+library(oligo)
+# library(clusterProfiler)
+library(BiocManager)
+library(preprocessCore)
+library(ggfortify)
+library(preprocessCore)
+library(DOSE)
+library(affy)
+library(affyio)
+library(ggplot2)
+library(tidyverse)
+library(tidyr)
+library(PhosR)
+library(directPA)
+library(pheatmap)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(limma)
+library(edgeR)
+library(Glimma)
+library(DESeq2)
+library(Homo.sapiens)
+library(naniar)
+library(plotly)
+library(writexl)
+library(pairsD3)
+library(GEOquery)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(gplots)
+library(dplyr)
+options(timeout = 100000)
+```
+
+# Defining some functions for use within the analysis
+```{r}
+ep_str_wrap <- function(string, width) {
+    x <- gregexpr(' ', string)
+    vapply(seq_along(x),
+           FUN = function(i) {
+               y <- x[[i]]
+               n <- nchar(string[i])
+               len <- (c(y,n) - c(0, y)) ## length + 1
+               idx <- len > width
+               j <- which(!idx)
+               if (length(j) && max(j) == length(len)) {
+                   j <- j[-length(j)]
+               }
+               if (length(j)) {
+                   idx[j] <- len[j] + len[j+1] > width
+               }
+               idx <- idx[-length(idx)] ## length - 1
+               start <- c(1, y[idx] + 1)
+               end <- c(y[idx] - 1, n)
+               words <- substring(string[i], start, end)
+               paste0(words, collapse="\n")
+           },
+           FUN.VALUE = character(1)
+    )
+}
+
+default_labeller <- function(n) {
+    function(str){
+        str <- gsub("_", " ", str)
+        ep_str_wrap(str, n)
+    }
+}
+
+Harrys.Plot <- function(height, x="Count", color='p.adjust',
+                                 showCategory=8, font.size=12, title="Barplot made by Harry",
+                                 label_format=30, ...) {
+    ## use *height* to satisy barplot generic definition
+    ## actually here is an enrichResult object.
+    object <- height
+
+    colorBy <- match.arg(color, c("Count", "pvalue", "p.adjust", "qvalue"))
+    if (x == "geneRatio" || x == "GeneRatio") {
+        x <- "GeneRatio"
+    }
+    else if (x == "count" || x == "Count") {
+        x <- "Count"
+    }
+    
+    else if (x == "log") {
+        x <- "log"
+    }
+
+    df <- fortify(object, showCategory=showCategory, by=x, ...)
+
+    if(colorBy %in% colnames(df)) {
+        p <- ggplot(df, aes_string(x = x, y = "Description", fill = colorBy)) +
+            theme_dose(font.size) +
+            scale_fill_continuous(low="red", high="blue", name = "Genes Within \nEnriched Pathway",
+                                  guide=guide_colorbar(reverse=TRUE))
+    } else {
+        p <- ggplot(df, aes_string(x = x, y = "Description",
+                                   fill = "Description")) +
+            theme_dose(font.size) +
+            theme(legend.position="none")
+    }
+
+    label_func <- default_labeller(label_format)
+    if(is.function(label_format)) {
+        label_func <- label_format
+    }
+
+    p + geom_col() + # geom_bar(stat = "identity") + coord_flip() +
+        scale_y_discrete(labels = label_func) +
+        ggtitle(title) + xlab("-log['10']* of P-value") + ylab(NULL)
+}
+
+Harrys.Dotplot <- function(object, x = "geneRatio", color = "p.adjust",
+                             showCategory=10, size=NULL, split = NULL,
+                             font.size=12, title = "", orderBy="x",
+                             decreasing=TRUE, label_format = 30) {
+
+    colorBy <- match.arg(color, c("Count", "pvalue", "p.adjust", "qvalue"))
+    if (x == "geneRatio" || x == "GeneRatio") {
+        x <- "GeneRatio"
+        if (is.null(size))
+            size <- "Count"
+    } else if (x == "log") {
+        x <- "log"
+        if (is.null(size))
+            size <- "Count"
+    } else if (x == "count" || x == "Count") {
+        x <- "Count"
+        if (is.null(size))
+            size <- "Count"
+    } else if (is(x, "formula")) {
+        x <- as.character(x)[2]
+        if (is.null(size))
+            size <- "Count"
+    } else {
+        ## message("invalid x, setting to 'GeneRatio' by default")
+        ## x <- "GeneRatio"
+        ## size <- "Count"
+        if (is.null(size))
+            size  <- "Count"
+    }
+
+    df <- fortify(object, showCategory = showCategory, split=split)
+    ## already parsed in fortify
+    ## df$GeneRatio <- parse_ratio(df$GeneRatio)
+
+    if (orderBy !=  'x' && !orderBy %in% colnames(df)) {
+        message('wrong orderBy parameter; set to default `orderBy = "x"`')
+        orderBy <- "x"
+    }
+
+    if (orderBy == "x") {
+        df <- dplyr::mutate(df, x = eval(parse(text=x)))
+    }
+
+    label_func <- default_labeller(label_format)
+    if(is.function(label_format)) {
+        label_func <- label_format
+    }
+
+    idx <- order(df[[orderBy]], decreasing = decreasing)
+    df$Description <- factor(df$Description,
+                          levels=rev(unique(df$Description[idx])))
+    ggplot(df, aes_string(x=x, y="Description", size=6 ,color=colorBy)) +
+        geom_point() +
+        scale_color_continuous(low="purple", high="yellow", name = "Genes Within \nEnriched Pathway",
+            guide=guide_colorbar(reverse=FALSE)) +
+        scale_y_discrete(labels = label_func) + xlab("-log10 of P-value") +
+        ylab(NULL) + ggtitle(title) + theme_dose(font.size) +
+        scale_size(range=c(3, 8))
+
+}
+```
+
+# Setting the mart object for use within the entire script. 
+```{r}
+mart <- useMart("ENSEMBL_MART_ENSEMBL")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+```
+
+```{r}
+sfiles <- getGEOSuppFiles("GSE13762")
+fnames <- rownames(sfiles)
+untar(fnames[1], exdir=file.path("untar_path", "GSE13762"))
+untar.file <- untar(fnames[1], exdir=file.path("untar_path", "GSE13762"), list = TRUE)
+fname <- file.path("untar_path", "GSE13762", untar.file)
+Data <- ReadAffy(filenames = fname)
+```
+
+```{r}
+tropical <- c("dodgerblue", "hotpink", "darkorange", "limegreen", "yellow")
+palette(tropical)
+colramp <- colorRampPalette(c(3,"white",2))(20)
+lcpm.XX <- log(exprs(Data))
+par(mfrow=c(1,2))
+plot(density(lcpm.XX[,1]), col=colramp, lwd=3,ylim=c(0,1), main = "Histogram of Un-Normalized Data", xlab = "Raw Counts")
+for(i in 1:12){lines(density(lcpm.XX[,i]), lwd=3, col=colramp)}
+Data <- normalize.AffyBatch.quantiles.robust(Data)
+lcpm.XX <- log(exprs(Data))
+plot(density(lcpm.XX[,1]), col=colramp, lwd=3,ylim=c(0,1), main = "Histogram of Normalized Data", xlab = "Raw Counts")
+for(i in 1:12){lines(density(lcpm.XX[,i]), lwd=3, col=colramp)}
+```
+
+```{r}
+e <- affy::rma(Data,normalize = FALSE) #Already normalized above
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "affy_hg_u133_plus_2",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "affy_hg_u133_plus_2",
+  values = rownames(exprs(e)), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$affy_hg_u133_plus_2))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$affy_hg_u133_plus_2)
+reorder_idx <- match(rownames(Gene), rownames(e))
+e <- e[reorder_idx,]
+colnames(exprs(e))
+```
+
+```{r}
+Renamed.Treatment <- c("Monocyte", "Vehicle.5.Day.Treated", "Vitamin.D.5.Day.Treated", "Vehicle.12.Hour.Treated", "Vitamin.D.12.Hour.Treated", 
+                       "Monocyte", "Vehicle.5.Day.Treated", "Vitamin.D.5.Day.Treated", "Vehicle.12.Hour.Treated", "Vitamin.D.12.Hour.Treated",
+                       "Monocyte", "Vehicle.5.Day.Treated", "Vitamin.D.5.Day.Treated", "Vehicle.12.Hour.Treated", "Vitamin.D.12.Hour.Treated")
+Organism <- rep("Homo Sapien", 15)
+TOLDCpheno <- data.frame(Organism, Treatment = Renamed.Treatment)
+rownames(TOLDCpheno) <- colnames(exprs(e))
+idx <- which(!duplicated(Gene$Symbol))
+Gene <- Gene[idx,]
+e <- e[idx,]
+```
+
+```{r}
+e <- ExpressionSet(assayData = exprs(e),
+                   phenoData = AnnotatedDataFrame(TOLDCpheno),
+                   featureData = AnnotatedDataFrame(Gene))
+```
+
+```{r}
+pca <- prcomp(t(exprs(e)), scale = TRUE)
+autoplot(pca, TOLDCpheno, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+autoplot(pca, x = 3, y = 4, TOLDCpheno, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+designTOL <- model.matrix(~0 + Treatment, data = TOLDCpheno)
+colnames(designTOL) <- sub("Treatment", "", colnames(designTOL))
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), designTOL)
+colnames(designTOL)
+```
+
+```{r}
+CM <- makeContrasts(Tolerogenic.Test = Vitamin.D.12.Hour.Treated - Vehicle.12.Hour.Treated,
+                    Tolerogenic.Test.5.Day = Vitamin.D.5.Day.Treated - Vehicle.5.Day.Treated,
+                    levels = designTOL)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "bonferroni", p.value = 0.05)
+topTable(efit,coef = "Tolerogenic.Test", number = 20)
+```
+
+```{r}
+Results.Study.1 <- topTable(efit,coef = "Tolerogenic.Test",number = Inf)
+Test.Statistics.Study.1 <- Results.Study.1 %>%
+dplyr::select(t)
+```
+
+# Second Included Study
+## GSE23371
+### GSE23371 is a study conducted by 
+```{r}
+sfiles <- getGEOSuppFiles("GSE23371")
+fnames <- rownames(sfiles)
+untar(fnames[1], exdir=file.path("untar_path", "GSE23371"))
+untar.file <- untar(fnames[1], exdir=file.path("untar_path", "GSE23371"), list = TRUE)
+fname <- file.path("untar_path", "GSE23371", untar.file)
+Data <- ReadAffy(filenames = fname)
+```
+
+```{r}
+tropical <- c("darkorange", "hotpink", "dodgerblue", "limegreen", "yellow")
+palette(tropical)
+colramp <- colorRampPalette(c(3,"white",2))(20)
+lcpm.XX <- log(exprs(Data))
+par(mfrow=c(1,2))
+plot(density(lcpm.XX[,1]), col=colramp, lwd=3,ylim=c(0,1), main = "Histogram of Un-Normalized Data")
+for(i in 1:12){lines(density(lcpm.XX[,i]), lwd=3, col=colramp)}
+Data <- normalize.AffyBatch.quantiles.robust(Data)
+lcpm.XX <- log(exprs(Data))
+plot(density(lcpm.XX[,1]), col=colramp, lwd=3,ylim=c(0,1), main = "Histogram of Normalized Data")
+for(i in 1:12){lines(density(lcpm.XX[,i]), lwd=3, col=colramp)}
+```
+
+```{r}
+e <- affy::rma(Data,normalize = FALSE) #Already normalized above
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "affy_hg_u133_plus_2",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "affy_hg_u133_plus_2",
+  values = rownames(exprs(e)), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$affy_hg_u133_plus_2))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$affy_hg_u133_plus_2)
+reorder_idx <- match(rownames(Gene), rownames(e))
+e <- e[reorder_idx,]
+head(exprs(e))
+```
+
+```{r}
+Renamed.Treatment <- c("Control", "Control", "Control", 
+                       "LPS", "LPS", "LPS", 
+                       "IL10.DEX", "IL10.DEX", "IL10.DEX",
+                       "IL10.DEX.LPS", "IL10.DEX.LPS", "IL10.DEX.LPS")
+Organism <- rep("Homo Sapien", 12)
+TOLDCpheno <- data.frame(Organism, Treatment = Renamed.Treatment)
+rownames(TOLDCpheno) <- colnames(exprs(e))
+idx <- which(!duplicated(Gene$Symbol))
+Gene <- Gene[idx,]
+e <- e[idx,]
+```
+
+```{r}
+e <- ExpressionSet(assayData = exprs(e),
+                   phenoData = AnnotatedDataFrame(TOLDCpheno),
+                   featureData = AnnotatedDataFrame(Gene))
+Expression.Paper.2 <- exprs(e)
+colnames(Expression.Paper.2) <- Renamed.Treatment
+rownames(Expression.Paper.2) <- fData(e)$Symbol
+
+```
+
+```{r}
+pca <- prcomp(t(exprs(e)), scale = TRUE)
+autoplot(pca, TOLDCpheno, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+autoplot(pca, x = 3, y = 4, TOLDCpheno, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+designTOL <- model.matrix(~0 + Treatment, data = TOLDCpheno)
+colnames(designTOL) <- sub("Treatment", "", colnames(designTOL))
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), designTOL)
+```
+
+```{r}
+CM <- makeContrasts(LPS = LPS - Control,
+                    DEX = IL10.DEX - Control,
+                    IL10.DEX.LPS = IL10.DEX.LPS - Control,
+                    IL10.DEX = IL10.DEX.LPS - IL10.DEX,
+                    levels = designTOL)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "bonferroni", p.value = 0.05)
+```
+
+```{r}
+Results.Study.3 <- topTable(efit,coef = "DEX",number = Inf)
+Test.Statistics.Study.3 <- Results.Study.3 %>%
+  dplyr::select(t)
+```
+
+# Third Included Study
+## GSE23371
+### GSE23371 is a study conducted by 
+```{r}
+sfiles <- getGEOSuppFiles("GSE56017")
+fnames <- rownames(sfiles)
+untar.file <- untar(fnames[1], list = TRUE)
+untar(fnames[1], exdir=file.path("untar_path", "GSE56017"))
+fname <- file.path("untar_path", "GSE56017", untar.file)
+Data <- ReadAffy(filenames = fname)
+```
+
+```{r}
+tropical <- c("darkorange", "hotpink", "limegreen", "dodgerblue", "yellow")
+palette(tropical)
+colramp <- colorRampPalette(c(3,"white",2))(20)
+lcpm.XX <- log(exprs(Data))
+par(mfrow=c(1,2))
+plot(density(lcpm.XX[,1]), col=colramp, lwd=3,ylim=c(0,1), main = "Histogram of Un-Normalized Data")
+for(i in 1:12){lines(density(lcpm.XX[,i]), lwd=3, col=colramp)}
+Data <- normalize.AffyBatch.quantiles.robust(Data)
+lcpm.XX <- log(exprs(Data))
+plot(density(lcpm.XX[,1]), col=colramp, lwd=3,ylim=c(0,1), main = "Histogram of Normalized Data")
+for(i in 1:12){lines(density(lcpm.XX[,i]), lwd=3, col=colramp)}
+```
+
+```{r}
+e <- affy::rma(Data,normalize = FALSE) #Already normalized above
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "affy_hg_u133_plus_2",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "affy_hg_u133_plus_2",
+  values = rownames(exprs(e)), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$affy_hg_u133_plus_2))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$affy_hg_u133_plus_2)
+reorder_idx <- match(rownames(Gene), rownames(e))
+e <- e[reorder_idx,]
+```
+
+```{r}
+Renamed.Treatment <- c("immature.DC", "immature.DEX.DC", "mature.DC", "tolerogenic.DC", 
+                       "immature.DC", "immature.DEX.DC", "mature.DC", "tolerogenic.DC", 
+                       "immature.DC", "immature.DEX.DC", "mature.DC", "tolerogenic.DC", 
+                       "mature.DC", "tolerogenic.DC", "immature.DC", "immature.DC", 
+                       "immature.DC", "mature.DC", "mature.DC", "mature.DC", 
+                       "tolerogenic.DC","tolerogenic.DC","tolerogenic.DC","tolerogenic.DC")
+Organism <- rep("Homo Sapien", 24)
+TOLDCpheno <- data.frame(Organism, Treatment = Renamed.Treatment)
+rownames(TOLDCpheno) <- colnames(exprs(e))
+idx <- which(!duplicated(Gene$Symbol))
+Gene <- Gene[idx,]
+e <- e[idx,]
+```
+
+```{r}
+e <- ExpressionSet(assayData = exprs(e),
+                   phenoData = AnnotatedDataFrame(TOLDCpheno),
+                   featureData = AnnotatedDataFrame(Gene))
+Expression.Paper.3 <- exprs(e)
+colnames(Expression.Paper.3) <- Renamed.Treatment
+rownames(Expression.Paper.3) <- fData(e)$Symbol
+```
+
+```{r}
+pca <- prcomp(t(exprs(e)), scale = TRUE)
+autoplot(pca, TOLDCpheno, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+autoplot(pca, x = 3, y = 4, TOLDCpheno, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+designTOL <- model.matrix(~0 + Treatment, data = TOLDCpheno)
+colnames(designTOL) <- sub("Treatment", "", colnames(designTOL))
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), designTOL)
+```
+
+```{r}
+CM <- makeContrasts(Tolerogenic.Test = tolerogenic.DC - immature.DC,
+                    levels = designTOL)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "bonferroni", p.value = 0.05)
+```
+
+```{r}
+Results.Study.6 <- topTable(efit,coef = "Tolerogenic.Test",number = Inf)
+Test.Statistics.Study.6 <- Results.Study.6 %>%
+  dplyr::select(t)
+```
+
+# Fourth Included Study
+## GSE117946
+### GSE117946 is a study conducted by 
+
+```{r}
+sfiles <- getGEOSuppFiles("GSE117946")
+fnames <- rownames(sfiles)
+untar.file <- untar(fnames[1], list = TRUE)
+untar(fnames[1], exdir=file.path("untar_path", "GSE117946"))
+fname <- file.path("untar_path", "GSE117946", untar.file)
+Data <- read.celfiles(filenames = fname)
+e <- oligo::rma(Data)
+```
+
+```{r}
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "affy_hugene_1_0_st_v1",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "affy_hugene_1_0_st_v1",
+  values = rownames(exprs(e)), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$affy_hugene_1_0_st_v1))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$affy_hugene_1_0_st_v1)
+reorder_idx <- match(rownames(Gene), rownames(e))
+e <- e[reorder_idx,]
+idx <- which(!duplicated(Gene$Symbol))
+Gene <- Gene[idx,]
+e <- e[idx,]
+```
+
+```{r}
+Renamed.Treatment <- c("mDC","mDC","mDC","mDC",
+                       "DC10", "DC10", "DC10", "DC10",
+                       "DC10LPS","DC10LPS","DC10LPS","DC10LPS",
+                       "imDC","imDC","imDC","imDC")
+Organism <- rep("Homo Sapien",16)
+PhenoData <- data.frame(Organism, Treatment = Renamed.Treatment, 
+                        row.names = colnames(exprs(e)))
+e <- ExpressionSet(assayData = exprs(e),
+                   phenoData = AnnotatedDataFrame(PhenoData),
+                   featureData = AnnotatedDataFrame(Gene))
+Expression.Paper.4 <- exprs(e)
+colnames(Expression.Paper.4) <- Renamed.Treatment
+rownames(Expression.Paper.4) <- fData(e)$Symbol
+```
+
+```{r}
+pca <- prcomp(t(exprs(e)), scale = TRUE)
+autoplot(pca, PhenoData, colour = "Treatment", size = 4) + theme_classic()
+autoplot(pca, x = 3, y = 4, PhenoData, colour = "Treatment", size = 4) + theme_classic()
+``` 
+
+```{r}
+design <- model.matrix(~0 + Treatment, data = pData(e))
+colnames(design) <- sub("Treatment", "", colnames(design))
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), design)
+```
+
+```{r}
+CM <- makeContrasts(LPS = mDC - imDC,
+                    DEX = DC10 - imDC,
+                    IL10.DEX.LPS = DC10LPS - imDC,
+                    levels = design)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "bonferroni", p.value = 0.05)
+```
+
+```{r}
+Results.Study.7 <- topTable(efit,coef = "DEX",number = Inf) 
+Test.Statistics.Study.7 <- Results.Study.7 %>%
+  dplyr::select(t)
+```
+
+# Fifth Included Study
+## GSE52894
+### GSE52894 is a study conducted by 
+
+```{r}
+sfiles <- getGEOSuppFiles("GSE52894")
+fnames <- rownames(sfiles)
+Data <- read.delim(gzfile(fnames[2]), header = TRUE)
+colnames(Data) <- Data[5,]
+Data <- Data[6:47328,]
+idx <- grep("Pval", colnames(Data))
+Data <- Data[,-idx]
+rownames(Data) <- Data[,1]
+Data <- Data[,-1]
+idx <- grep("R", colnames(Data))
+Data <- Data[,-idx]
+```
+
+```{r}
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "illumina_humanht_12_v4",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "illumina_humanht_12_v4",
+  values = rownames(Data), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$illumina_humanht_12_v4))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$illumina_humanht_12_v4)
+reorder_idx <- match(rownames(Gene), rownames(Data))
+Assay <- Data[reorder_idx,]
+idx <- which(!duplicated(Gene$Symbol) & !duplicated(Gene$EntrezID))
+Gene <- Gene[idx,]
+Assay <- Assay[idx,]
+Assay = data.frame(lapply(Assay, function(x) as.numeric(x)), check.names=FALSE, 
+                   row.names = rownames(Assay))
+Assay <- as.matrix(Assay)
+Assay <- normalize.quantiles.robust(Assay)
+```
+
+```{r}
+Renamed.Treatment <- c("IL4", "IL4.LPS", "IL4.VD3.DEX.LPS", "IL4.VD3.DEX",
+                       "IL4", "IL4.LPS", "IL4.VD3.DEX.LPS", "IL4.VD3.DEX", 
+                       "IL4", "IL4.LPS", "IL4.VD3.DEX.LPS", "IL4.VD3.DEX", 
+                       "IL4", "IL4.LPS", "IL4.VD3.DEX.LPS", "IL4.VD3.DEX")
+Organism <- rep("Homo-Sapien",16)
+PhenoData <- data.frame(Treatment = Renamed.Treatment, Organism, 
+                        row.names = colnames(Assay))
+e <- ExpressionSet(assayData = Assay,
+                   phenoData = AnnotatedDataFrame(PhenoData),
+                   featureData = AnnotatedDataFrame(Gene))
+Expression.Paper.5 <- exprs(e)
+colnames(Expression.Paper.5) <- Renamed.Treatment
+rownames(Expression.Paper.5) <- fData(e)$Symbol
+```
+
+```{r}
+pca <- prcomp(t(exprs(e)), scale = TRUE)
+autoplot(pca, PhenoData, colour = "Treatment", size = 4) + theme_classic()
+autoplot(pca, x = 3, y = 4, PhenoData, colour = "Treatment", size = 4) + theme_classic()
+```
+
+```{r}
+design <- model.matrix(~0 + Treatment, data = pData(e))
+colnames(design) <- sub("Treatment", "", colnames(design))
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), design)
+```
+
+```{r}
+CM <- makeContrasts(LPS = IL4.LPS - IL4,
+                    DEX = IL4.VD3.DEX - IL4,
+                    IL10.DEX.LPS = IL4.VD3.DEX.LPS - IL4,
+                    levels = design)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "bonferroni", p.value = 0.05)
+```
+
+```{r}
+Results.Study.10 <- topTable(efit,coef = "DEX",number = Inf) 
+Test.Statistics.Study.10 <- Results.Study.10 %>%
+ dplyr::select(t)
+```
+
+#Aggreagting the results of each study
+```{r}
+int <- intersect(rownames(Test.Statistics.Study.1),rownames(Test.Statistics.Study.3))
+int2 <- intersect(rownames(Test.Statistics.Study.6),rownames(Test.Statistics.Study.7))
+int3 <- intersect(int, rownames(Test.Statistics.Study.10))
+int4 <- intersect(int, int2)
+int5 <- intersect(int4, int3)
+Test.Statisitc.All <- cbind(Test.Statistics.Study.1[int5,],
+                            Test.Statistics.Study.3[int5,],
+                            Test.Statistics.Study.6[int5,],
+                            Test.Statistics.Study.7[int5,],
+                            Test.Statistics.Study.10[int5,])
+rownames(Test.Statisitc.All) <- int5
+colnames(Test.Statisitc.All) <- c("Vitamin D", 
+                                  "Interleukin-10 & Dexamethasone", 
+                                  "Dexamethasone",
+                                  "Interleukin-10",
+                                  "Dexamethasone & Vitamin D")
+```
+
+```{r}
+Z.Scores.All <- apply(Test.Statisitc.All, 2, function(x){qnorm(rank(x)/(nrow(Test.Statisitc.All)+1))})
+data(Pathways)
+gene.pvalues <- apply(Z.Scores.All, 1, geneStats)
+gene.zscores <- qnorm(gene.pvalues, lower.tail = FALSE)
+pvalue2sided=2*pnorm(-abs(gene.zscores))
+sig.genes.tol <- names(pvalue2sided %>%
+  subset(pvalue2sided < 0.00001))
+sig.genes.tol <- sig.genes.tol[-which(sig.genes.tol == "")]
+sig.genes.tol
+```
+
+```{r}
+Final.Table <- as.data.frame(Z.Scores.All) %>%
+  mutate(Combined_Pvalue_PM = pvalue2sided,
+         Symbol = rownames(Z.Scores.All))
+# write_xlsx(Final.Table, "Final.Table.xlsx")
+```
+
+```{r, fig.height=10}
+Z.Score.Significant <- Z.Scores.All[which(rownames(Z.Scores.All) %in% sig.genes.tol),]
+pheatmap::pheatmap(Z.Score.Significant,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(150),
+         cellwidth = 40,
+         angle_col = 315,
+         scale = "column")
+```
+
+```{r}
+sig.genes.tol.ORDERED <- c("C1QA", "TSPAN14", "CD93", "GK", "EPB41L3", "NCOA4",
+                           "BRD8", "MS4A4A", "C5AR1", "CD300LF", "NINJ1", "SEMA6B",
+                           "NCF1C", "SMPDL3A", "TREM1", "CEBPB", "DRAM1", "CD14",
+                           "NOD2", "ACSL1", "MMP12", "CALCRL", "IRF4", "HCAR2", "RGS18",
+                           "C1orf115", "VCL", "FCER1A", "KCTD6", "PPP1R16A", "IL1RAP",
+                           "ESYT1", "NRGN", "ISYNA1", "KIAA0100", "CD1C", "CD1E", "CD1B",
+                           "ZFP69", "SCRN1", "PEA15", "NDRG2", "TRIM36", "MTCL1", "CDH1",
+                           "NCAPH", "CD1A", "SLC27A3", "BCAR3", "GALNT12")
+```
+
+```{r}
+EntrezID <- mapIds(Homo.sapiens, keys = names(gene.zscores), column = c("ENTREZID"), keytype = "SYMBOL", multiVals = "first")
+idx <- which(!duplicated(EntrezID) & !is.na(EntrezID))
+gene.zscores <- gene.zscores[idx]
+names(gene.zscores) <- EntrezID[idx]
+geneList <- gene.zscores
+gene <- names(geneList)
+PathwayKEGG <- enrichKEGG(gene)
+barplot(PathwayKEGG) + xlab("Genes Within Each Pathway")
+y <- as.data.frame(enrichKEGG(gene))
+y <- y %>%
+  dplyr::mutate(log = -log(p.adjust))
+# Barplot of selected pathways
+Harrys.Plot(y[c(6,11,9,35,24,137,15,76,117,5),], x = "log")
+```
+
+```{r,fig.height=11}
+#Barplot of all pathways
+Harrys.Plot(y)
+```
+
+```{r, fig.height=3.5}
+library(org.Hs.eg.db)
+organism = org.Hs.eg.db
+geneList = sort(geneList, decreasing = TRUE)
+gene <- geneList
+gse <- gseGO(geneList=gene, 
+             ont ="ALL", 
+             keyType = "ENTREZID",
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             eps = 0,
+             pvalueCutoff = 0.05, 
+             verbose = TRUE,
+             seed = 1234,
+             OrgDb = organism)
+K <- as.data.frame(gse)
+K <- K %>%
+  dplyr::mutate(log = -log(p.adjust)) %>%
+  arrange(K, NES)
+colnames(K) <- c("ONTOLOGY", "ID", "Description", "Count", "enrichmentScore", "NES", "pvalue", "p.adjust", "qvalues", "rank", "leading_edge", "core_enrichment", "log")
+K$Pathway.Direction <- cut(K$NES, c(-Inf,0,Inf), c("Supressed Pathways", "Upregulated Pathways"))
+# Dotplot of the first 30 pathways listed in analysis
+Harrys.Dotplot(K[1:30,], showCategory=10, x = "log", color = "Count") + 
+  facet_grid(. ~ Pathway.Direction) 
+```
+
+```{r, fig.height=28,fig.width=8}
+# Dotplot of all pathways that were enriched
+Harrys.Dotplot(K, showCategory=10, x = "log", color = "Count") + 
+  facet_grid(. ~ Pathway.Direction) 
+```
