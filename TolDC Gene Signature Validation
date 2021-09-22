@@ -1,0 +1,294 @@
+---
+title: "GSE104438"
+author: "Harry Robertson"
+date: "11/08/2021"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(GEOquery)
+library(edgeR)
+library(BiocManager)
+library(limma)
+library(DESeq2)
+library(RColorBrewer)
+library(dplyr)
+library(Homo.sapiens)
+library(biomaRt)
+mart <- useMart("ENSEMBL_MART_ENSEMBL")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+```
+
+# load series and platform data from GEO
+
+```{r}
+gset <- getGEO("GSE104438", GSEMatrix =TRUE, AnnotGPL=FALSE)
+if (length(gset) > 1) idx <- grep("GPL14550", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# make proper column names to match toptable 
+fvarLabels(gset) <- make.names(fvarLabels(gset))
+
+# group membership for all samples
+gsms <- "000000111111XXXXXX"
+sml <- strsplit(gsms, split="")[[1]]
+
+# filter out excluded samples (marked as "X")
+sel <- which(sml != "X")
+sml <- sml[sel]
+gset <- gset[ ,sel]
+
+# log2 transformation
+ex <- exprs(gset)
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+          (qx[6]-qx[1] > 50 && qx[2] > 0)
+if (LogC) { ex[which(ex <= 0)] <- NaN
+  exprs(gset) <- log2(ex) }
+```
+
+# assign samples to groups and set up design matrix
+```{r}
+gs <- factor(sml)
+groups <- make.names(c("tolDC","imDC"))
+levels(gs) <- groups
+gset$group <- gs
+design <- model.matrix(~group + 0, gset)
+colnames(design) <- levels(gs)
+design
+fit <- lmFit(gset, design)  # fit linear model
+
+# set up contrasts of interest and recalculate model coefficients
+cts <- paste(groups[1], groups[2], sep="-")
+cont.matrix <- makeContrasts(contrasts=cts, levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+
+# compute statistics and table of top significant genes
+fit2 <- eBayes(fit2, 0.01)
+tT <- topTable(fit2, adjust="fdr", sort.by="B", number=Inf)
+tT <- subset(tT, select=c("GENE_SYMBOL","t"))
+tT <- tT[which(!duplicated(tT$GENE_SYMBOL) & !is.na(tT$GENE_SYMBOL)),]
+rownames(tT) <- tT[,1]
+Results.1 <- tT[,-1, drop = FALSE]
+```
+
+```{r}
+sfiles <- getGEOSuppFiles("GSE98480")
+fnames <- rownames(sfiles)
+Data <- read.delim(gzfile(fnames[1]))
+Counts <- Data[,-grep("pvalue", colnames(Data))]
+rownames(Counts) <- Counts[,1]
+Counts <- Counts[,-1]
+colnames(Counts) <- c("GSM2597248", "GSM2597249", "GSM2597250", "GSM2597251",
+                      "GSM2597252", "GSM2597253", "GSM2597254", "GSM2597255",
+                      "GSM2597256", "GSM2597257", "GSM2597258", "GSM2597259")
+Counts <- normalizeQuantiles(Counts)
+Counts <- log(Counts + 1)
+```
+
+```{r}
+Treatment <- c("imDC", "tolDC", "mDC", "PicDC",
+               "imDC", "tolDC", "mDC", "PicDC",
+               "imDC", "tolDC", "mDC", "PicDC")
+Organism <- rep("Human", 12)
+PhenoData <- data.frame(Treatment, Organism,
+                        row.names = colnames(Counts))
+e <- ExpressionSet(assayData = as.matrix(Counts),
+                   phenoData = AnnotatedDataFrame(PhenoData))
+```
+
+```{r}
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "illumina_humanht_12_v4",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "illumina_humanht_12_v4",
+  values = rownames(exprs(e)), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$illumina_humanht_12_v4))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$illumina_humanht_12_v4)
+reorder_idx <- match(rownames(Gene), rownames(e))
+e <- e[reorder_idx,]
+idx <- which(!duplicated(Gene$Symbol))
+Gene <- Gene[idx,]
+e <- e[idx,]
+```
+
+```{r}
+design <- model.matrix(~0 + Treatment, data = PhenoData)
+colnames(design) <- sub("Treatment", "", colnames(design))
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), design)
+colnames(design)
+```
+
+```{r}
+CM <- makeContrasts(Tolerogenic.Test = tolDC - imDC,
+                    Mature.Test = mDC - imDC,
+                    levels = design)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "bonferroni", p.value = 0.05)
+JJ <- topTable(efit, coef = "Tolerogenic.Test", n = Inf)
+Results.2 <- JJ %>%
+  dplyr::select(t)
+Results.2
+```
+
+```{r}
+sfiles <- getGEOSuppFiles("GSE47621")
+fnames <- rownames(sfiles)
+untar(fnames[1], exdir=file.path("untar_path", "GSE47621"))
+untar.file <- untar(fnames[1], exdir=file.path("untar_path", "GSE47621"), list = TRUE)
+fname <- file.path("untar_path", "GSE47621", untar.file)
+Data <- read.celfiles(filenames = fname)
+e <- oligo::rma(Data)
+```
+
+```{r}
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c(
+    "affy_hugene_1_0_st_v1",
+    "ensembl_gene_id",
+    "gene_biotype",
+    "entrezgene_id",
+    "external_gene_name"),
+  filter = "affy_hugene_1_0_st_v1",
+  values = rownames(exprs(e)), 
+  uniqueRows=TRUE)
+order <- which(!duplicated(annotLookup$affy_hugene_1_0_st_v1))
+annotLookup <- annotLookup[order,]
+Gene <- data.frame(Symbol = annotLookup$external_gene_name, EntrezID = annotLookup$entrezgene_id, row.names = annotLookup$affy_hugene_1_0_st_v1)
+reorder_idx <- match(rownames(Gene), rownames(e))
+e <- e[reorder_idx,]
+idx <- which(!duplicated(Gene$Symbol))
+Gene <- Gene[idx,]
+e <- e[idx,]
+```
+
+```{r}
+Renamed.Treatment <- c("imDC","tolDC","imDC","tolDC",
+                       "imDC", "imDC", "tolDC", "tolDC")
+Donor <- c("Donor_1", "Donor_1", "Donor_2", "Donor_2",
+           "Donor_3", "Donor_4", "Donor_4", "Donor_3")
+Organism <- rep("Homo Sapien",8)
+PhenoData <- data.frame(Organism, Treatment = Renamed.Treatment, Donor,
+                        row.names = colnames(exprs(e)))
+e <- ExpressionSet(assayData = exprs(e),
+                   phenoData = AnnotatedDataFrame(PhenoData),
+                   featureData = AnnotatedDataFrame(Gene))
+```
+
+```{r}
+pca <- prcomp(t(exprs(e)), scale = TRUE, center = TRUE)
+autoplot(pca, PhenoData, colour = "Treatment", size = 5) + theme_classic()
+autoplot(pca, x = 3, y = 4, PhenoData, colour = "Treatment", size = 5) + theme_classic()
+``` 
+
+```{r}
+# exprs(e) <- removeBatchEffect(e,Donor)
+# pca <- prcomp(t(exprs(e)), scale = TRUE)
+# autoplot(pca, PhenoData, colour = "Treatment", size = 2) + theme_classic()
+# autoplot(pca, x = 3, y = 4, PhenoData, colour = "Treatment", size = 2) + theme_classic()
+```
+
+```{r}
+design <- model.matrix(~Donor + Treatment, data = pData(e))
+colnames(design) <- sub("Treatment", "", colnames(design))
+design
+rownames(e) <- Gene$Symbol
+fit <- lmFit(exprs(e), design)
+```
+
+```{r, fig.height=5}
+# CM <- makeContrasts(TolDC = tolDC - imDC,
+#                     levels = design)
+# fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit)
+results <- decideTests(efit,adjust.method = "BH", p.value = 0.05)
+summary(results)
+JJJ <- topTable(efit, coef = "tolDC", n = Inf)
+Results.3 <- JJJ %>%
+  dplyr::select(t)
+```
+
+```{r}
+sfiles <- getGEOSuppFiles("GSE92852")
+fnames <- rownames(sfiles)
+Data <- read.delim(gzfile(fnames[1]))
+Counts <- as.data.frame(t(Data)[-1,])
+colnames(Counts) <- c("GSM2438534", "GSM2438535", "GSM2438536", "GSM2438537",
+                      "GSM2438538", "GSM2438539", "GSM2438540", "GSM2438541",
+                      "GSM2438542", "GSM2438543", "GSM2438544", "GSM2438545")
+Counts <- Counts[rowMeans(Counts) > 5,]
+```
+
+```{r}
+Treatment <- c("imDC","mDC","tolDC","tolDCLPS",
+                       "imDC","mDC","tolDC","tolDCLPS",
+                       "imDC","mDC","tolDC","tolDCLPS")
+Organism <- rep("Homo Sapien",12)
+PhenoData <- data.frame(Organism, Treatment,
+                        row.names = colnames(Counts))
+```
+
+```{r}
+design <- model.matrix(~0 + Treatment)
+vCounts <- voom(Counts, design, plot = TRUE)
+fit <- lmFit(vCounts, design)
+colnames(design) <- sub("Treatment", "", colnames(design))
+colnames(design)
+CM <- makeContrasts(TolDC = tolDC - imDC,
+                    levels = design)
+fit2 <- contrasts.fit(fit, CM)
+efit <- eBayes(fit2)
+results <- decideTests(efit, adjust.method = "BH", p.value = 0.05)
+summary(results)
+top.table <- topTable(efit, sort.by = "P", n = Inf)
+Results.4 <- top.table %>%
+  dplyr::select(t)
+Results.4
+```
+
+```{r}
+annotation_row = data.frame(
+                    Expected_Direction = factor(rep(c("Up-regulated", "Down-regulated"), 
+                                               c(19, 30))))
+rownames(annotation_row) = rownames(Z.Score.Significant)
+newCols <- colorRampPalette(grDevices::rainbow(length(unique(annotation_row$Expected_Direction))))
+mycolors <- newCols(length(unique(annotation_row$Expected_Direction)))
+names(mycolors) <- unique(annotation_row$Expected_Direction)
+mycolors <- list(Expected_Direction = mycolors)
+```
+
+```{r, fig.height=6}
+int1 <- intersect(rownames(Results.1), rownames(Results.2))
+int2 <- intersect(int, rownames(Results.4))
+Test.Statisitc.All <- cbind(Results.1[int2,],
+                            Results.2[int2,],
+                            Results.4[int2,])
+rownames(Test.Statisitc.All) <- int2
+colnames(Test.Statisitc.All) <- c("Low Dose GM-CSF", 
+                                  "TLR7/8 Ligand R848",
+                                  "Interleukin 10")
+Z.Scores.All <- apply(Test.Statisitc.All, 2, function(x){qnorm(rank(x)/(nrow(Test.Statisitc.All)+1))})
+Z.Scores.All <- as.data.frame(Z.Scores.All)
+Z.Score.Significant <- Z.Scores.All[sig.genes.tol.ORDERED,]
+Z.Score.Significant <- Z.Score.Significant[-13,]
+Z.Score.Significant
+pheatmap::pheatmap(Z.Score.Significant,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         cellwidth = 40,
+         angle_col = 315,
+         cluster_rows = FALSE,
+         annotation_row = annotation_row,
+         annotation_colors = mycolors,
+         scale = "column")
+```
